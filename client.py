@@ -162,7 +162,7 @@ External Indexing:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("query", nargs="?", help="Search query")
+    parser.add_argument("query", nargs="*", help="Search query")
     parser.add_argument("--vault_path", default="e:/Obsidian Vault", help="Path to Obsidian vault")
     parser.add_argument("--scope", help="Optional folder/path substring to scope search")
     parser.add_argument("--index", help="Search only a specific index name")
@@ -182,6 +182,9 @@ if __name__ == "__main__":
         refresh_cache(args.vault_path, vault_cache)
 
     if args.query:
+        # Join list into string if it's multiple words
+        query_text = " ".join(args.query) if isinstance(args.query, list) else args.query
+        
         # Start by finding all available indices
         indices = [("vault", vault_cache)]
         if os.path.exists(CENTRAL_INDEX_STORE):
@@ -195,10 +198,10 @@ if __name__ == "__main__":
             indices = [idx for idx in indices if idx[0] == args.index]
 
         # Try daemon
-        results = try_daemon_search(args.query, scope=args.scope, index=args.index, threshold=args.threshold)
+        results = try_daemon_search(query_text, scope=args.scope, index=args.index, threshold=args.threshold)
         
         if results is None:
             # Slow fallback
-            results = search_indexed_files(args.query, indices, scope=args.scope, threshold=args.threshold)
+            results = search_indexed_files(query_text, indices, scope=args.scope, threshold=args.threshold)
             
         print(json.dumps(results, indent=2))
