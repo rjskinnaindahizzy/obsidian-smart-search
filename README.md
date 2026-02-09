@@ -17,7 +17,7 @@ A powerful, semantic search engine for your Obsidian vault and external director
 1. **Clone the repository:**
 
     ```bash
-    git clone <repository-url>
+    git clone https://github.com/rjskinnaindahizzy/obsidian-smart-search.git
     cd obsidian-smart-search
     ```
 
