@@ -1,0 +1,17 @@
+# AI artifacts
+docs/MaraudersMap/
+.maraudersmapmd/
+
+# Python
+.venv/
+__pycache__/
+
+# Generated indices
+*.npz
+.smart-env/
+
+# Test artifacts
+test_index_dir/
+
+# Claude Code
+.claude/
