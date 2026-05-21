@@ -2,9 +2,11 @@ import os
 import json
 import sys
 import argparse
+import shutil
 import socket
 import subprocess
 import time
+from datetime import datetime
 
 import numpy as np
 
@@ -14,6 +16,7 @@ from shared import (
     CENTRAL_INDEX_STORE,
     DEFAULT_INDEX,
     DEFAULT_THRESHOLD,
+    DEFAULT_TOP_K,
     INDEXABLE_EXTENSIONS,
     MAX_QUERY_LENGTH,
     MAX_FILE_SIZE,
@@ -21,6 +24,7 @@ from shared import (
     chunk_text,
     get_model,
     cosine_similarity,
+    deduplicate_results,
     hybrid_boost,
     try_daemon_reload,
     try_daemon_stop,
@@ -29,7 +33,6 @@ from shared import (
 
 def start_daemon(vault_path):
     """Start the Search Booster daemon in the background."""
-    # Validate vault_path before spawning a subprocess
     vault_path = os.path.realpath(vault_path)
     if not os.path.isdir(vault_path):
         print(f"Error: vault path is not an existing directory: {vault_path}", file=sys.stderr)
@@ -42,11 +45,17 @@ def start_daemon(vault_path):
         print(f"Error: daemon.py not found at {daemon_script}", file=sys.stderr)
         return False
 
+    # Use uv if available; fall back to the current Python interpreter.
+    if shutil.which("uv"):
+        cmd = ["uv", "run", "--with", "numpy", "--with", "sentence-transformers",
+               daemon_script, vault_path]
+    else:
+        cmd = [sys.executable, daemon_script, vault_path]
+
     try:
         print(f"Starting Search Booster for {vault_path}...", file=sys.stderr)
         subprocess.Popen(
-            [sys.executable, "-m", "uv", "run", "--with", "numpy", "--with", "sentence-transformers",
-             daemon_script, vault_path],
+            cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -60,18 +69,33 @@ def start_daemon(vault_path):
 def _send_daemon_request(request, timeout=0.2):
     """Send a JSON request to the daemon and return the parsed response.
 
+    Shuts down the write side after sending so the daemon knows the message
+    is complete, then reads the response until the connection closes.
     Returns None on any connection or protocol error.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
         s.connect((DAEMON_HOST, DAEMON_PORT))
         s.sendall(json.dumps(request).encode('utf-8'))
-        response = s.recv(131072).decode('utf-8', errors='replace')
-        return json.loads(response)
+        s.shutdown(socket.SHUT_WR)  # signal end-of-request to daemon
+
+        # Read response in a loop — a single recv may not get everything.
+        chunks = []
+        s.settimeout(10.0)  # generous timeout for large result sets
+        try:
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except socket.timeout:
+            pass  # partial read on a slow response; attempt parse anyway
+
+        return json.loads(b''.join(chunks).decode('utf-8', errors='replace'))
 
 
 def try_daemon_search(query, scope=None, index=None, threshold=DEFAULT_THRESHOLD,
-                      vault_path=None, auto_start=True, hybrid=False):
+                      top_k=DEFAULT_TOP_K, vault_path=None, auto_start=True, hybrid=False):
     """Try to search using the daemon. Auto-start if not running."""
     request = {
         "command": "search",
@@ -79,6 +103,7 @@ def try_daemon_search(query, scope=None, index=None, threshold=DEFAULT_THRESHOLD
         "scope": scope,
         "index": index,
         "threshold": threshold,
+        "top_k": top_k,
         "hybrid": hybrid,
     }
 
@@ -112,13 +137,13 @@ def try_daemon_search(query, scope=None, index=None, threshold=DEFAULT_THRESHOLD
 
 def refresh_cache(vault_path, cache_path):
     multi_path = os.path.join(vault_path, ".smart-env", "multi")
-
     paths = []
     vectors = []
+    non_taylor_models = set()
 
-    print(f"Aggregating embeddings from {multi_path}...")
+    print(f"Aggregating embeddings from {multi_path}...", file=sys.stderr)
     if not os.path.exists(multi_path):
-        print(f"Error: Multi-path not found at {multi_path}")
+        print(f"Error: Multi-path not found at {multi_path}", file=sys.stderr)
         return
 
     for filename in os.listdir(multi_path):
@@ -138,26 +163,51 @@ def refresh_cache(vault_path, cache_path):
                             if isinstance(val, dict) and "embeddings" in val:
                                 embeds = val["embeddings"]
                                 found_vec = None
+                                found_model = None
+                                # Prefer TaylorAI; fall back to first available model.
                                 for mod_key, mod_val in embeds.items():
-                                    if "TaylorAI" in mod_key and "vec" in mod_val:
-                                        found_vec = mod_val["vec"]
-                                        break
+                                    if "vec" in mod_val:
+                                        if "TaylorAI" in mod_key:
+                                            found_vec = mod_val["vec"]
+                                            found_model = mod_key
+                                            break
+                                        elif found_vec is None:
+                                            found_vec = mod_val["vec"]
+                                            found_model = mod_key
 
                                 if found_vec:
+                                    if found_model and "TaylorAI" not in found_model:
+                                        non_taylor_models.add(found_model)
                                     path = val.get("path") or key.replace("smart_sources:", "").replace("smart_blocks:", "")
                                     paths.append(path)
                                     vectors.append(found_vec)
                     except (json.JSONDecodeError, KeyError, ValueError):
                         continue
 
+    if not paths:
+        print(
+            "Warning: No embeddings found in Smart Connections cache. "
+            "Is your vault indexed by the Smart Connections plugin?",
+            file=sys.stderr,
+        )
+        return
+
+    if non_taylor_models:
+        print(
+            f"Warning: TaylorAI/bge-micro-v2 embeddings not found; "
+            f"using {', '.join(sorted(non_taylor_models))} instead. "
+            f"Search quality may differ from expected.",
+            file=sys.stderr,
+        )
+
     np.savez_compressed(cache_path, paths=np.array(paths), vectors=np.array(vectors))
-    print(f"Cache saved to {cache_path} ({len(paths)} vectors)")
+    print(f"Cache saved: {len(paths)} vectors → {cache_path}", file=sys.stderr)
 
     if try_daemon_reload():
-        print("Notified Search Booster to reload.")
+        print("Notified Search Booster to reload.", file=sys.stderr)
 
 
-def search_indexed_files(query, indices, top_k=20, threshold=DEFAULT_THRESHOLD,
+def search_indexed_files(query, indices, top_k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD,
                          scope=None, hybrid=False):
     """Search indexed files. If hybrid=True, boost scores for keyword matches."""
     all_results = []
@@ -194,18 +244,7 @@ def search_indexed_files(query, indices, top_k=20, threshold=DEFAULT_THRESHOLD,
             print(f"Error loading {label}: {e}", file=sys.stderr)
 
     all_results.sort(key=lambda x: x["score"], reverse=True)
-
-    # Deduplicate
-    seen = set()
-    unique = []
-    for r in all_results:
-        if r["path"] not in seen:
-            unique.append(r)
-            seen.add(r["path"])
-        if len(unique) >= top_k:
-            break
-
-    return unique
+    return deduplicate_results(all_results, top_k)
 
 
 def get_cache_name_for_path(dir_path):
@@ -215,7 +254,7 @@ def get_cache_name_for_path(dir_path):
     return f"autoscan_{safe_name[:100]}"
 
 
-def search_unindexed_directory(query, dir_path, top_k=20, threshold=DEFAULT_THRESHOLD):
+def search_unindexed_directory(query, dir_path, top_k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD):
     """Scan and index a directory. Caches results for future searches."""
     cache_name = get_cache_name_for_path(dir_path)
     cache_path = os.path.join(CENTRAL_INDEX_STORE, f"{cache_name}.npz")
@@ -236,7 +275,7 @@ def search_unindexed_directory(query, dir_path, top_k=20, threshold=DEFAULT_THRE
                 if score >= threshold:
                     results.append({"path": str(paths[i]), "score": float(score), "index": cache_name})
             results.sort(key=lambda x: x["score"], reverse=True)
-            return results[:top_k]
+            return deduplicate_results(results, top_k)
         except (OSError, ValueError) as e:
             print(f"Cache read failed, rescanning: {e}", file=sys.stderr)
 
@@ -265,7 +304,6 @@ def search_unindexed_directory(query, dir_path, top_k=20, threshold=DEFAULT_THRE
     if not file_paths:
         return []
 
-    # Chunk files for sharper embeddings
     chunk_paths = []
     chunk_texts = []
     for fpath, ftext in zip(file_paths, file_texts):
@@ -278,7 +316,6 @@ def search_unindexed_directory(query, dir_path, top_k=20, threshold=DEFAULT_THRE
     query_vec = model.encode(query)
     doc_vecs = model.encode(chunk_texts, show_progress_bar=True)
 
-    # Cache the chunked embeddings for future use
     os.makedirs(CENTRAL_INDEX_STORE, exist_ok=True)
     np.savez_compressed(cache_path, paths=np.array(chunk_paths), vectors=doc_vecs)
     print(f"Cached index saved: {cache_path}", file=sys.stderr)
@@ -290,18 +327,8 @@ def search_unindexed_directory(query, dir_path, top_k=20, threshold=DEFAULT_THRE
         if score >= threshold:
             results.append({"path": str(chunk_paths[i]), "score": float(score), "index": cache_name})
 
-    # Deduplicate: keep highest-scoring chunk per file
     results.sort(key=lambda x: x["score"], reverse=True)
-    seen = set()
-    unique = []
-    for r in results:
-        if r["path"] not in seen:
-            unique.append(r)
-            seen.add(r["path"])
-        if len(unique) >= top_k:
-            break
-
-    return unique
+    return deduplicate_results(results, top_k)
 
 
 def remove_index(index_name, vault_path=None):
@@ -346,11 +373,8 @@ def remove_index(index_name, vault_path=None):
 
 def list_indices(vault_cache):
     """List all available indices with metadata."""
-    from datetime import datetime
-
     indices = []
 
-    # Check vault cache
     if os.path.exists(vault_cache):
         try:
             data = np.load(vault_cache, allow_pickle=False)
@@ -368,7 +392,6 @@ def list_indices(vault_cache):
         except (OSError, ValueError):
             pass
 
-    # Check central store
     if os.path.exists(CENTRAL_INDEX_STORE):
         for f in os.listdir(CENTRAL_INDEX_STORE):
             if f.endswith(".npz"):
@@ -415,11 +438,12 @@ Options:
                      Note: If folder isn't indexed, a one-off slow scan will run.
   --index <name>     Search only a specific index (e.g., 'vault', 'documents').
                      Use '--index all' to search all indices (overrides default).
+  --top-k <n>        Number of results to return (default {DEFAULT_TOP_K}).
   --list             List all available indices.
   --refresh          Rebuild the Obsidian vault cache.
   --remove <name>    Remove an index by name.
   --threshold <val>  Similarity threshold (0.0-1.0, default {DEFAULT_THRESHOLD}).
-  --hybrid           Combine semantic + keyword matching (default: on).
+  --hybrid           Combine semantic + path/filename keyword matching (default: on).
   --no-hybrid        Disable hybrid mode (pure semantic search).
   --stop             Stop the background Search Booster daemon.
   -h, --help         Show this help menu.
@@ -440,17 +464,17 @@ if __name__ == "__main__":
     parser.add_argument("--vault_path", default=os.environ.get("OBSIDIAN_VAULT_PATH"), help="Path to Obsidian vault")
     parser.add_argument("--scope", help="Optional folder/path substring to scope search")
     parser.add_argument("--index", help="Search only a specific index name")
+    parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, dest="top_k", help=f"Number of results to return (default {DEFAULT_TOP_K})")
     parser.add_argument("--list", action="store_true", help="List all available indices")
     parser.add_argument("--refresh", action="store_true", help="Rebuild the vector cache")
     parser.add_argument("--remove", help="Remove an index by name")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="Similarity threshold (0.0-1.0)")
-    parser.add_argument("--hybrid", action="store_true", default=True, help="Combine semantic + keyword matching (default: on)")
+    parser.add_argument("--hybrid", action="store_true", default=True, help="Combine semantic + path/filename keyword matching (default: on)")
     parser.add_argument("--no-hybrid", dest="hybrid", action="store_false", help="Disable hybrid mode (pure semantic search)")
     parser.add_argument("--stop", action="store_true", help="Stop the Search Booster daemon")
     parser.add_argument("-h", "--help", action="store_true", help="Show help")
     args = parser.parse_args()
 
-    # Handle --stop before anything else (doesn't require vault_path)
     if args.stop:
         if try_daemon_stop():
             print("Search Booster daemon stopped.")
@@ -483,12 +507,10 @@ if __name__ == "__main__":
     if args.query:
         query_text = " ".join(args.query) if isinstance(args.query, list) else args.query
 
-        # Validate query length
         if len(query_text) > MAX_QUERY_LENGTH:
             print(f"Error: Query exceeds maximum length of {MAX_QUERY_LENGTH} characters.", file=sys.stderr)
             sys.exit(1)
 
-        # Build index list
         indices = [("vault", vault_cache)]
         if os.path.exists(CENTRAL_INDEX_STORE):
             for f in os.listdir(CENTRAL_INDEX_STORE):
@@ -496,7 +518,6 @@ if __name__ == "__main__":
                     name = f.replace(".npz", "")
                     indices.append((name, os.path.join(CENTRAL_INDEX_STORE, f)))
 
-        # Filter by requested index if specified (or use default)
         effective_index = args.index or DEFAULT_INDEX
         if effective_index and effective_index.lower() != "all":
             filtered = [idx for idx in indices if idx[0] == effective_index]
@@ -508,22 +529,24 @@ if __name__ == "__main__":
             else:
                 indices = filtered
 
-        # Try daemon (with auto-start if not running)
+        # Try daemon first (with auto-start). Only fall back to local search
+        # if the daemon is unavailable (None) — trust empty results from daemon.
         results = try_daemon_search(
             query_text, scope=args.scope, index=effective_index,
-            threshold=args.threshold, vault_path=args.vault_path, hybrid=args.hybrid,
+            threshold=args.threshold, top_k=args.top_k,
+            vault_path=args.vault_path, hybrid=args.hybrid,
         )
 
-        if results is None or (results == [] and indices):
-            # Daemon unavailable or returned nothing — try local search
-            local_results = search_indexed_files(
-                query_text, indices, scope=args.scope,
+        if results is None:
+            # Daemon unavailable — run local search across all loaded indices.
+            results = search_indexed_files(
+                query_text, indices, top_k=args.top_k, scope=args.scope,
                 threshold=args.threshold, hybrid=args.hybrid,
             )
-            if local_results:
-                results = local_results
 
         if not results and args.scope and os.path.isdir(args.scope):
-            results = search_unindexed_directory(query_text, args.scope, threshold=args.threshold)
+            results = search_unindexed_directory(
+                query_text, args.scope, top_k=args.top_k, threshold=args.threshold,
+            )
 
         print(json.dumps(results, indent=2))
