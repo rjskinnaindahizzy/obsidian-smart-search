@@ -11,9 +11,11 @@ from shared import (
     DAEMON_PORT,
     CENTRAL_INDEX_STORE,
     DEFAULT_THRESHOLD,
+    DEFAULT_TOP_K,
     MAX_QUERY_LENGTH,
     MODEL_NAME,
     cosine_similarity,
+    deduplicate_results,
     hybrid_boost,
 )
 
@@ -62,16 +64,15 @@ class SearchDaemon:
         self.indices = new_indices
         print("Ready.")
 
-    def handle_search(self, query, top_k=20, threshold=DEFAULT_THRESHOLD,
+    def handle_search(self, query, top_k=DEFAULT_TOP_K, threshold=DEFAULT_THRESHOLD,
                       scope=None, target_index=None, hybrid=False):
         query_vec = self.model.encode(query)
         all_results = []
 
-        # For hybrid mode, pre-compute query words
         query_words = query.lower().split() if hybrid else []
 
         # Filter indices to search (--index all or absent → search everything)
-        to_search = self.indices.items()
+        to_search = list(self.indices.items())
         if target_index and target_index.lower() != "all" and target_index in self.indices:
             to_search = [(target_index, self.indices[target_index])]
 
@@ -92,25 +93,28 @@ class SearchDaemon:
                         all_results.append({"path": path, "score": effective_score, "index": label})
 
         all_results.sort(key=lambda x: x["score"], reverse=True)
-
-        seen = set()
-        unique = []
-        for r in all_results:
-            if r["path"] not in seen:
-                unique.append(r)
-                seen.add(r["path"])
-            if len(unique) >= top_k:
-                break
-
-        return unique
+        return deduplicate_results(all_results, top_k)
 
     # ── Graceful shutdown ────────────────────────────────────────────
     def _handle_signal(self, signum, frame):
         print(f"\nReceived signal {signum}, shutting down...")
         self._running = False
 
+    def _recv_request(self, conn):
+        """Read the full request from a connection.
+
+        The client signals end-of-request by shutting down its write side
+        (SHUT_WR), so we loop until recv returns empty bytes (EOF).
+        """
+        chunks = []
+        while True:
+            part = conn.recv(4096)
+            if not part:
+                break
+            chunks.append(part)
+        return b''.join(chunks).decode('utf-8', errors='replace')
+
     def run(self):
-        # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
 
@@ -125,15 +129,15 @@ class SearchDaemon:
                 try:
                     conn, addr = s.accept()
                 except socket.timeout:
-                    continue  # Check self._running and loop
+                    continue
 
                 with conn:
                     try:
-                        raw = conn.recv(4096)
-                        if not raw:
-                            continue
-                        data = raw.decode('utf-8', errors='replace')
+                        data = self._recv_request(conn)
                     except OSError:
+                        continue
+
+                    if not data:
                         continue
 
                     try:
@@ -150,6 +154,7 @@ class SearchDaemon:
 
                             results = self.handle_search(
                                 query,
+                                top_k=request.get("top_k", DEFAULT_TOP_K),
                                 scope=request.get("scope"),
                                 target_index=request.get("index"),
                                 threshold=request.get("threshold", DEFAULT_THRESHOLD),
