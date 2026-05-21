@@ -12,7 +12,7 @@ import numpy as np
 
 # ── Network ──────────────────────────────────────────────────────────
 DAEMON_HOST = '127.0.0.1'
-DAEMON_PORT = 5555
+DAEMON_PORT = int(os.environ.get("SMART_SEARCH_PORT", 5555))
 
 # ── Paths ────────────────────────────────────────────────────────────
 CENTRAL_INDEX_STORE = os.environ.get(
@@ -26,6 +26,7 @@ MODEL_NAME = "TaylorAI/bge-micro-v2"
 
 # ── Search defaults ──────────────────────────────────────────────────
 DEFAULT_THRESHOLD = 0.45
+DEFAULT_TOP_K = 20
 MAX_QUERY_LENGTH = 10_000
 MAX_FILE_SIZE = 1_048_576  # 1 MB
 
@@ -104,6 +105,9 @@ def hybrid_boost(path, query_words):
 
     Returns a boost value (0.0 – 0.5) to add to the semantic score.
 
+    Note: boosts on filename/path keywords only — file content is not loaded
+    at search time. This is not a full content-level keyword match.
+
     Boosting rules (applied in priority order):
       - Exact filename match (with or without extension): +0.4
       - Partial filename match:                          +0.2
@@ -130,6 +134,19 @@ def hybrid_boost(path, query_words):
             path_boost = max(path_boost, 0.1)
 
     return filename_boost + path_boost
+
+
+def deduplicate_results(results, top_k):
+    """Deduplicate a sorted result list by path, keeping highest-scoring entry per file."""
+    seen = set()
+    unique = []
+    for r in results:
+        if r["path"] not in seen:
+            unique.append(r)
+            seen.add(r["path"])
+        if len(unique) >= top_k:
+            break
+    return unique
 
 
 def try_daemon_reload():
